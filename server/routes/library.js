@@ -509,42 +509,65 @@ async function epicToken(params) {
   return data;
 }
 
+// Run an async worker over items with a fixed concurrency (no inter-item delay).
+async function mapPool(items, limit, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (next < items.length) {
+        const i = next++;
+        results[i] = await worker(items[i]);
+      }
+    })
+  );
+  return results;
+}
+
+// Resolve one namespace + id-chunk to game entries via Epic's catalog service.
+async function epicCatalogChunk(ns, ids, accessToken) {
+  const qs = ids.map((id) => `id=${id}`).join('&');
+  const out = [];
+  try {
+    const { data: items } = await axios.get(
+      `https://catalog-public-service-prod06.ol.epicgames.com/catalog/api/shared/namespace/${ns}/bulk/items?${qs}&country=US&locale=en-US&includeMainGameDetails=true`,
+      { headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000 }
+    );
+    for (const [catId, item] of Object.entries(items ?? {})) {
+      const cats = (item.categories ?? []).map((c) => c.path);
+      const isGame = cats.some((c) => c === 'games' || c.startsWith('games/'));
+      const isAddon = cats.some((c) => c === 'addons' || c.startsWith('addons/')) || !!item.mainGameItem;
+      if (!isGame || isAddon) continue;
+      if (/^unreal engine/i.test(item.title ?? '')) continue;
+      const img = (item.keyImages ?? []).find((k) => ['DieselStoreFrontTall', 'OfferImageTall', 'Thumbnail'].includes(k.type)) ?? item.keyImages?.[0];
+      out.push({ id: catId, title: item.title, image: img?.url ?? null });
+    }
+  } catch { /* skip this chunk */ }
+  return out;
+}
+
 async function epicFetchLibrary(accessToken) {
   const { data: assets } = await axios.get(
     'https://launcher-public-service-prod06.ol.epicgames.com/launcher/api/public/assets/Windows?label=Live',
     { headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000 }
   );
 
-  // Group catalog item ids by namespace (skip Unreal Engine assets).
+  // Epic gives most games their own namespace, so we group ids by namespace and
+  // chunk them, then resolve every chunk CONCURRENTLY (this was the slow part —
+  // it used to run one namespace at a time, sequentially).
   const byNs = {};
   for (const a of assets ?? []) {
     if (!a.namespace || !a.catalogItemId || a.namespace === 'ue') continue;
     (byNs[a.namespace] ??= new Set()).add(a.catalogItemId);
   }
-
-  const games = [];
+  const tasks = [];
   for (const [ns, idSet] of Object.entries(byNs)) {
     const ids = [...idSet];
-    for (let i = 0; i < ids.length; i += 40) {
-      const qs = ids.slice(i, i + 40).map((id) => `id=${id}`).join('&');
-      try {
-        const { data: items } = await axios.get(
-          `https://catalog-public-service-prod06.ol.epicgames.com/catalog/api/shared/namespace/${ns}/bulk/items?${qs}&country=US&locale=en-US&includeMainGameDetails=true`,
-          { headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000 }
-        );
-        for (const [catId, item] of Object.entries(items ?? {})) {
-          const cats = (item.categories ?? []).map((c) => c.path);
-          const isGame = cats.some((c) => c === 'games' || c.startsWith('games/'));
-          const isAddon = cats.some((c) => c === 'addons' || c.startsWith('addons/')) || !!item.mainGameItem;
-          if (!isGame || isAddon) continue;
-          if (/^unreal engine/i.test(item.title ?? '')) continue;
-          const img = (item.keyImages ?? []).find((k) => ['DieselStoreFrontTall', 'OfferImageTall', 'Thumbnail'].includes(k.type)) ?? item.keyImages?.[0];
-          games.push({ id: catId, title: item.title, image: img?.url ?? null });
-        }
-      } catch { /* skip this chunk */ }
-    }
+    for (let i = 0; i < ids.length; i += 40) tasks.push({ ns, ids: ids.slice(i, i + 40) });
   }
-  return games;
+
+  const chunks = await mapPool(tasks, 12, (t) => epicCatalogChunk(t.ns, t.ids, accessToken));
+  return chunks.flat();
 }
 
 router.put('/epic', requireAuth, async (req, res) => {
