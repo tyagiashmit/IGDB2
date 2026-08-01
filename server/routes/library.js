@@ -96,8 +96,9 @@ async function enrichItems(items, cache, keyOf, nameOf) {
   const unmatched = items.filter((g) => !(keyOf(g) in cache));
   const toMatch = unmatched.slice(0, 50); // cap new matches per call; rest resolve on later loads
 
-  const BATCH = 4; // 4 concurrent + ~1s spacing ≈ 4 req/sec
+  const BATCH = 4; // IGDB allows ~4 requests/sec — fire 4 at a time, one burst per second
   for (let i = 0; i < toMatch.length; i += BATCH) {
+    const started = Date.now();
     const batch = toMatch.slice(i, i + BATCH);
     await Promise.all(batch.map(async (g) => {
       try {
@@ -109,7 +110,11 @@ async function enrichItems(items, cache, keyOf, nameOf) {
         cache[keyOf(g)] = null;
       }
     }));
-    if (i + BATCH < toMatch.length) await new Promise((r) => setTimeout(r, 1100));
+    // Keep batch starts ~1s apart (subtract time the requests already took).
+    if (i + BATCH < toMatch.length) {
+      const wait = Math.max(0, 1000 - (Date.now() - started));
+      if (wait) await new Promise((r) => setTimeout(r, wait));
+    }
   }
 
   await saveCache(cache);
@@ -345,6 +350,235 @@ router.get('/gog/games', requireAuth, async (req, res) => {
     res.json(dedupeByIgdb(mapped));
   } catch (err) {
     console.error('gog/games error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Xbox (via OpenXBL / xbl.io) ────────────────────────────────────────────────
+// Xbox Live has no public API for third parties, so we use OpenXBL: each user
+// signs in at xbl.io with their Microsoft account and pastes their personal key.
+const XBL = 'https://xbl.io/api/v2';
+const xblHeaders = (key) => ({ 'X-Authorization': key, Accept: 'application/json' });
+// OpenXBL wraps every payload as { content: <actual>, code: <n> }.
+const xblUnwrap = (data) => (data && typeof data === 'object' && 'content' in data && 'code' in data) ? data.content : data;
+
+async function fetchXboxAccount(apiKey) {
+  const { data } = await axios.get(`${XBL}/account`, { headers: xblHeaders(apiKey), timeout: 10000 });
+  const payload = xblUnwrap(data);
+  const u = payload?.profileUsers?.[0] ?? (payload?.id ? payload : null);
+  if (!u) {
+    const detail = typeof payload === 'string' ? payload : JSON.stringify(payload ?? data).slice(0, 250);
+    throw new Error(`OpenXBL: ${detail}`);
+  }
+  const gamertag = u.settings?.find((s) => s.id === 'Gamertag')?.value ?? u.gamertag ?? 'Xbox Player';
+  return { xuid: u.id, gamertag };
+}
+
+async function fetchXboxTitles(apiKey) {
+  const { data } = await axios.get(`${XBL}/player/titleHistory`, { headers: xblHeaders(apiKey), timeout: 15000 });
+  const payload = xblUnwrap(data);
+  return (payload?.titles ?? [])
+    .filter((t) => !t.type || t.type === 'Game')
+    .map((t) => ({
+      titleId: t.titleId,
+      name: t.name,
+      image: t.displayImage ?? t.images?.find?.((i) => i.type === 'BoxArt')?.url ?? null,
+    }));
+}
+
+router.put('/xbox', requireAuth, async (req, res) => {
+  const { apiKey } = req.body;
+  if (!apiKey?.trim()) return res.status(400).json({ error: 'OpenXBL API key is required' });
+
+  let profile;
+  try {
+    profile = await fetchXboxAccount(apiKey.trim());
+  } catch (err) {
+    const status = err.response?.status;
+    console.error('xbox connect error:', status, err.message, JSON.stringify(err.response?.data)?.slice(0, 300));
+    if (status === 401 || status === 403)
+      return res.status(400).json({ error: 'Invalid OpenXBL API key. Sign in at xbl.io and copy your key.' });
+    if (status === 429)
+      return res.status(400).json({ error: 'OpenXBL rate limit reached. Wait a minute and try again.' });
+    return res.status(400).json({ error: `Could not connect to OpenXBL (${status ?? err.code ?? 'unknown'}). ${err.message}` });
+  }
+
+  const users = await loadUsers();
+  const idx = users.findIndex((u) => u.id === req.user.id);
+  if (idx === -1) return res.status(404).json({ error: 'User not found' });
+  users[idx].connectedAccounts ??= {};
+  users[idx].connectedAccounts.xbox = { apiKey: apiKey.trim(), xuid: profile.xuid, gamertag: profile.gamertag, connectedAt: new Date().toISOString() };
+  await saveUsers(users);
+  res.json({ gamertag: profile.gamertag });
+});
+
+router.delete('/xbox', requireAuth, async (req, res) => {
+  const users = await loadUsers();
+  const idx = users.findIndex((u) => u.id === req.user.id);
+  if (idx !== -1) { delete users[idx].connectedAccounts?.xbox; await saveUsers(users); }
+  res.json({ ok: true });
+});
+
+router.get('/xbox/games', requireAuth, async (req, res) => {
+  const users = await loadUsers();
+  const user  = users.find((u) => u.id === req.user.id);
+  const xbox  = user?.connectedAccounts?.xbox;
+  if (!xbox?.apiKey) return res.status(400).json({ error: 'Xbox account not connected' });
+
+  try {
+    const titles = (await fetchXboxTitles(xbox.apiKey)).filter((t) => t.name && !isJunk(t.name));
+    let cache = await loadCache();
+    cache = await enrichItems(titles.slice(0, 200), cache, (g) => `xbox:${g.titleId}`, (g) => g.name);
+
+    const mapped = titles.slice(0, 200).map((g) => {
+      const match = cache[`xbox:${g.titleId}`];
+      const igdbCover = match?.cover ? `https://images.igdb.com/igdb/image/upload/t_cover_big/${match.cover}.jpg` : null;
+      return {
+        id: g.titleId,
+        title: g.name,
+        url: null,
+        image: igdbCover ?? g.image,
+        coverUrl: igdbCover ?? g.image,
+        igdbId: match?.igdbId ?? null,
+        genres: match?.genres ?? [],
+        year: match?.year ?? null,
+      };
+    });
+
+    res.json(dedupeByIgdb(mapped));
+  } catch (err) {
+    console.error('xbox/games error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Epic Games (unofficial launcher auth, à la Legendary/Heroic) ────────────────
+// Epic has no public library API. We use the launcher's public client creds:
+// the user pastes an authorizationCode (from an Epic login URL), we exchange it
+// for tokens, then read owned assets and resolve them via the catalog service.
+const EPIC_CLIENT_ID = '34a02cf8f4414e29b15921876da36f9a';
+const EPIC_CLIENT_SECRET = 'daafbccc737745039dffe53d94fc76cf';
+const EPIC_BASIC = 'Basic ' + Buffer.from(`${EPIC_CLIENT_ID}:${EPIC_CLIENT_SECRET}`).toString('base64');
+const EPIC_OAUTH = 'https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token';
+
+async function epicToken(params) {
+  const { data } = await axios.post(EPIC_OAUTH, new URLSearchParams(params).toString(), {
+    headers: { Authorization: EPIC_BASIC, 'Content-Type': 'application/x-www-form-urlencoded' },
+    timeout: 12000,
+  });
+  return data;
+}
+
+async function epicFetchLibrary(accessToken) {
+  const { data: assets } = await axios.get(
+    'https://launcher-public-service-prod06.ol.epicgames.com/launcher/api/public/assets/Windows?label=Live',
+    { headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000 }
+  );
+
+  // Group catalog item ids by namespace (skip Unreal Engine assets).
+  const byNs = {};
+  for (const a of assets ?? []) {
+    if (!a.namespace || !a.catalogItemId || a.namespace === 'ue') continue;
+    (byNs[a.namespace] ??= new Set()).add(a.catalogItemId);
+  }
+
+  const games = [];
+  for (const [ns, idSet] of Object.entries(byNs)) {
+    const ids = [...idSet];
+    for (let i = 0; i < ids.length; i += 40) {
+      const qs = ids.slice(i, i + 40).map((id) => `id=${id}`).join('&');
+      try {
+        const { data: items } = await axios.get(
+          `https://catalog-public-service-prod06.ol.epicgames.com/catalog/api/shared/namespace/${ns}/bulk/items?${qs}&country=US&locale=en-US&includeMainGameDetails=true`,
+          { headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000 }
+        );
+        for (const [catId, item] of Object.entries(items ?? {})) {
+          const cats = (item.categories ?? []).map((c) => c.path);
+          const isGame = cats.some((c) => c === 'games' || c.startsWith('games/'));
+          const isAddon = cats.some((c) => c === 'addons' || c.startsWith('addons/')) || !!item.mainGameItem;
+          if (!isGame || isAddon) continue;
+          if (/^unreal engine/i.test(item.title ?? '')) continue;
+          const img = (item.keyImages ?? []).find((k) => ['DieselStoreFrontTall', 'OfferImageTall', 'Thumbnail'].includes(k.type)) ?? item.keyImages?.[0];
+          games.push({ id: catId, title: item.title, image: img?.url ?? null });
+        }
+      } catch { /* skip this chunk */ }
+    }
+  }
+  return games;
+}
+
+router.put('/epic', requireAuth, async (req, res) => {
+  const { authorizationCode } = req.body;
+  if (!authorizationCode?.trim()) return res.status(400).json({ error: 'Epic authorization code is required' });
+
+  let token;
+  try {
+    token = await epicToken({ grant_type: 'authorization_code', code: authorizationCode.trim(), token_type: 'eg1' });
+  } catch {
+    return res.status(400).json({ error: 'Invalid or expired Epic authorization code. Get a fresh code and try again (it expires within minutes).' });
+  }
+
+  const users = await loadUsers();
+  const idx = users.findIndex((u) => u.id === req.user.id);
+  if (idx === -1) return res.status(404).json({ error: 'User not found' });
+  users[idx].connectedAccounts ??= {};
+  users[idx].connectedAccounts.epic = {
+    accountId: token.account_id,
+    displayName: token.displayName ?? 'Epic Player',
+    refreshToken: token.refresh_token,
+    connectedAt: new Date().toISOString(),
+  };
+  await saveUsers(users);
+  res.json({ displayName: token.displayName ?? 'Epic Player' });
+});
+
+router.delete('/epic', requireAuth, async (req, res) => {
+  const users = await loadUsers();
+  const idx = users.findIndex((u) => u.id === req.user.id);
+  if (idx !== -1) { delete users[idx].connectedAccounts?.epic; await saveUsers(users); }
+  res.json({ ok: true });
+});
+
+router.get('/epic/games', requireAuth, async (req, res) => {
+  const users = await loadUsers();
+  const idx = users.findIndex((u) => u.id === req.user.id);
+  const epic = users[idx]?.connectedAccounts?.epic;
+  if (!epic?.refreshToken) return res.status(400).json({ error: 'Epic account not connected' });
+
+  let accessToken;
+  try {
+    const token = await epicToken({ grant_type: 'refresh_token', refresh_token: epic.refreshToken, token_type: 'eg1' });
+    accessToken = token.access_token;
+    // Persist the rotated refresh token so future refreshes keep working.
+    users[idx].connectedAccounts.epic.refreshToken = token.refresh_token;
+    await saveUsers(users);
+  } catch {
+    return res.status(400).json({ error: 'Epic session expired. Please reconnect your Epic account.' });
+  }
+
+  try {
+    const owned = (await epicFetchLibrary(accessToken)).filter((g) => g.title && !isJunk(g.title));
+    let cache = await loadCache();
+    cache = await enrichItems(owned.slice(0, 200), cache, (g) => `epic:${g.id}`, (g) => g.title);
+
+    const mapped = owned.slice(0, 200).map((g) => {
+      const match = cache[`epic:${g.id}`];
+      const igdbCover = match?.cover ? `https://images.igdb.com/igdb/image/upload/t_cover_big/${match.cover}.jpg` : null;
+      return {
+        id: g.id,
+        title: g.title,
+        url: null,
+        image: igdbCover ?? g.image,
+        coverUrl: igdbCover ?? g.image,
+        igdbId: match?.igdbId ?? null,
+        genres: match?.genres ?? [],
+        year: match?.year ?? null,
+      };
+    });
+
+    res.json(dedupeByIgdb(mapped));
+  } catch (err) {
+    console.error('epic/games error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });

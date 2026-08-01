@@ -5,8 +5,8 @@ import { useAuth } from '../context/AuthContext';
 const PLATFORMS = [
   { id: 'steam',   label: 'Steam',       available: true },
   { id: 'gog',     label: 'GOG',         available: true },
-  { id: 'epic',    label: 'Epic Games',  available: false },
-  { id: 'xbox',    label: 'Xbox',        available: false },
+  { id: 'epic',    label: 'Epic Games',  available: true },
+  { id: 'xbox',    label: 'Xbox',        available: true },
 ];
 
 export default function Library() {
@@ -83,6 +83,7 @@ export default function Library() {
 
       {PLATFORMS.find((p) => p.id === activePlatform)?.available ? (
         <PlatformPanel
+          key={activePlatform}
           platform={activePlatform}
           account={accounts?.[activePlatform]}
           onAccountChange={(updated) => setAccounts((a) => ({ ...a, ...updated }))}
@@ -101,23 +102,29 @@ function PlatformPanel({ platform, account, onAccountChange, authFetch }) {
   const [games, setGames]     = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError]     = useState('');
+  // Ignore responses from a fetch that has been superseded (tab switch / refresh)
+  // so a slow Steam request can never populate the GOG tab, and vice versa.
+  const reqId = useRef(0);
 
   useEffect(() => {
     if (account) loadGames();
-  }, [account]);
+    return () => { reqId.current++; }; // invalidate in-flight request on unmount/re-run
+  }, [account, platform]);
 
   async function loadGames() {
+    const myReq = ++reqId.current;
     setLoading(true);
     setError('');
     try {
       const res = await authFetch(`/api/library/${platform}/games`);
       const data = await res.json();
+      if (myReq !== reqId.current) return; // a newer request started — drop this result
       if (!res.ok) throw new Error(data.error);
       setGames(data);
     } catch (err) {
-      setError(err.message);
+      if (myReq === reqId.current) setError(err.message);
     } finally {
-      setLoading(false);
+      if (myReq === reqId.current) setLoading(false);
     }
   }
 
@@ -142,7 +149,11 @@ function PlatformPanel({ platform, account, onAccountChange, authFetch }) {
       <div className="library-panel-header">
         <span className="library-connected-label">
           <span className="connected-dot" />
-          {platform === 'steam' ? `Steam ID: ${account.steamId}` : `GOG: ${account.username}`}
+          {platform === 'steam' ? `Steam ID: ${account.steamId}`
+            : platform === 'gog' ? `GOG: ${account.username}`
+            : platform === 'xbox' ? `Xbox: ${account.gamertag}`
+            : platform === 'epic' ? `Epic: ${account.displayName}`
+            : 'Connected'}
         </span>
         <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
           <button className="btn-ghost" onClick={loadGames} disabled={loading}>↺ Refresh</button>
@@ -159,7 +170,7 @@ function PlatformPanel({ platform, account, onAccountChange, authFetch }) {
 
       {loading && (
         <>
-          <p className="library-loading-note">Fetching library and matching games to IGDB…</p>
+          <p className="library-loading-note">Fetching your library and matching games… the first load can take a little while, then it's cached and instant.</p>
           <div className="loading-grid">
             {Array.from({ length: 12 }).map((_, i) => <div key={i} className="skeleton-card" />)}
           </div>
@@ -205,17 +216,17 @@ function ConnectForm({ platform, authFetch, onConnected }) {
     }
   }
 
-  // GOG: username-based
-  async function handleGogSubmit(e) {
+  // GOG / Xbox / Epic: identifier- or code-based connect
+  async function handleConnectSubmit(e) {
     e.preventDefault();
     if (!value.trim()) return;
     setConnecting(true);
     setError('');
     try {
-      const res = await authFetch('/api/library/gog', {
+      const res = await authFetch(`/api/library/${platform}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ gogUsername: value.trim() }),
+        body: JSON.stringify({ [cfg.bodyKey]: value.trim() }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
@@ -252,34 +263,79 @@ function ConnectForm({ platform, authFetch, onConnected }) {
     );
   }
 
+  const cfg = CONNECT_CONFIG[platform];
+
   return (
     <div className="connect-panel">
       <div className="connect-card">
         <div className="connect-icon"><PlatformIcon id={platform} size={40} /></div>
-        <h2 className="connect-title">Connect GOG</h2>
-        <p className="connect-desc">
-          Enter your GOG username. Your GOG profile and game list must be set to <strong>Public</strong>.
-        </p>
-        <form className="connect-form" onSubmit={handleGogSubmit}>
-          <label className="form-label">GOG Username</label>
+        <h2 className="connect-title">{cfg.title}</h2>
+        <p className="connect-desc">{cfg.desc}</p>
+        {cfg.steps && (
+          <ol className="connect-steps">
+            {cfg.steps.map((s, i) => <li key={i}>{s}</li>)}
+          </ol>
+        )}
+        {cfg.link && (
+          <a className="connect-link-btn" href={cfg.link.href} target="_blank" rel="noopener noreferrer">
+            {cfg.link.text}
+          </a>
+        )}
+        <form className="connect-form" onSubmit={handleConnectSubmit}>
+          <label className="form-label">{cfg.label}</label>
           <input
             ref={inputRef}
             type="text"
             className="form-input"
-            placeholder="your-gog-username"
+            placeholder={cfg.placeholder}
             value={value}
             onChange={(e) => setValue(e.target.value)}
             disabled={connecting}
           />
           {error && <p className="connect-error">{error}</p>}
           <button type="submit" className="btn-primary" disabled={connecting || !value.trim()}>
-            {connecting ? 'Connecting…' : 'Connect GOG Account'}
+            {connecting ? 'Connecting…' : cfg.button}
           </button>
         </form>
       </div>
     </div>
   );
 }
+
+// Per-platform connect UI (Steam handled separately via OpenID)
+const CONNECT_CONFIG = {
+  gog: {
+    title: 'Connect GOG',
+    desc: 'Enter your GOG username. Your GOG profile and game list must be set to Public.',
+    label: 'GOG Username',
+    placeholder: 'your-gog-username',
+    bodyKey: 'gogUsername',
+    button: 'Connect GOG Account',
+  },
+  xbox: {
+    title: 'Connect Xbox',
+    desc: 'Xbox has no public API, so GameVault uses OpenXBL. Sign in with your Microsoft account, generate a free API key, and paste it below.',
+    label: 'OpenXBL API Key',
+    placeholder: 'paste your xbl.io API key',
+    bodyKey: 'apiKey',
+    button: 'Connect Xbox Account',
+    link: { href: 'https://xbl.io/', text: 'Get your free API key at xbl.io →' },
+  },
+  epic: {
+    title: 'Connect Epic Games',
+    desc: 'Epic has no public library API, so this uses the launcher sign-in flow.',
+    label: 'Epic Authorization Code',
+    placeholder: 'paste the authorizationCode value',
+    bodyKey: 'authorizationCode',
+    button: 'Connect Epic Account',
+    link: { href: 'https://www.epicgames.com/id/login?redirectUrl=https%3A%2F%2Fwww.epicgames.com%2Fid%2Fapi%2Fredirect%3FclientId%3D34a02cf8f4414e29b15921876da36f9a%26responseType%3Dcode', text: 'Log in to Epic & get your code →' },
+    steps: [
+      'Click the link above and sign in to Epic (in this browser).',
+      'After login it shows a small JSON response.',
+      'Copy the value of "authorizationCode" (the long string in quotes) and paste it below — it expires within minutes.',
+    ],
+  },
+};
 
 // ── Library game card ─────────────────────────────────────────────────────────
 
