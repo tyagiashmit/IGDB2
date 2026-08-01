@@ -2,6 +2,8 @@ import { useState, useRef, useEffect } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { useFavorites } from '../context/FavoritesContext';
+import { useGamification } from '../context/GamificationContext';
+import { levelFromXp } from '../utils/gamification';
 
 export default function Navbar({ bgImage, setBgImage }) {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -17,6 +19,8 @@ export default function Navbar({ bgImage, setBgImage }) {
   const navigate = useNavigate();
   const { isLoggedIn, user, logout, setShowLoginModal } = useAuth();
   const { favorites } = useFavorites();
+  const { stats } = useGamification();
+  const lvl = levelFromXp(stats.xp);
   const dropRef = useRef(null);
   const fileInputRef = useRef(null);
 
@@ -230,6 +234,30 @@ export default function Navbar({ bgImage, setBgImage }) {
               <Link to="/library" className="nav-link">🎮 Library</Link>
             </>
           )}
+
+          {isLoggedIn ? (
+            <Link to="/profile" className="xp-widget" title={`Level ${lvl.level} · ${stats.xp} XP`}>
+              <span className="xp-level-badge">{lvl.level}</span>
+              <span className="xp-widget-body">
+                <span className="xp-widget-top">
+                  <span>LVL {lvl.level}</span>
+                  <span>{lvl.toNext} to go</span>
+                </span>
+                <span className="xp-track">
+                  <span className="xp-fill" style={{ width: `${lvl.pct}%` }} />
+                </span>
+              </span>
+            </Link>
+          ) : (
+            <button
+              className="xp-widget locked"
+              title="Log in to earn XP and level up"
+              onClick={() => setShowLoginModal(true)}
+            >
+              <span className="xp-level-badge">🔒</span>
+              <span className="xp-locked-text">Log in to earn XP</span>
+            </button>
+          )}
         </nav>
 
         <div className="auth-section">
@@ -248,6 +276,10 @@ export default function Navbar({ bgImage, setBgImage }) {
 
               {dropdownOpen && (
                 <div className="dropdown">
+                  <Link to="/profile" className="dropdown-item" onClick={() => setDropdownOpen(false)}>
+                    <span>🏆</span> My Profile
+                    <span className="dropdown-count">Lv {lvl.level}</span>
+                  </Link>
                   <Link to="/favorites" className="dropdown-item" onClick={() => setDropdownOpen(false)}>
                     <span>♥</span> My Favorites
                     {favCount > 0 && <span className="dropdown-count">{favCount}</span>}

@@ -24,6 +24,7 @@ export default function GameCard({ game }) {
               ★ {game.communityRating.toFixed(1)}
             </div>
           )}
+          <span className="card-quickview">View Game →</span>
         </div>
         <div className="card-body">
           <h3 className="card-title">{game.name}</h3>
@@ -33,6 +34,18 @@ export default function GameCard({ game }) {
               <span key={g.name} className="badge">{g.name}</span>
             ))}
           </div>
+          {game.communityRating != null && (
+            <div>
+              <div className="card-score-row">
+                <span>Community</span>
+                <strong>★ {game.communityRating.toFixed(1)}</strong>
+                <span>/10</span>
+              </div>
+              <div className="card-ratingbar">
+                <div className="card-ratingbar-fill" style={{ width: `${(game.communityRating / 10) * 100}%` }} />
+              </div>
+            </div>
+          )}
         </div>
       </Link>
       <FavoriteButton gameId={String(game.id)} size="sm" className="card-fav-btn" />

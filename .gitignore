@@ -1,3 +1,9 @@
 node_modules/
 .env
 dist/
+
+# Runtime data (user accounts, reviews, favorites, library cache) — not source
+server/data/users.json
+server/data/reviews.json
+server/data/favorites.json
+server/data/library-cache.json

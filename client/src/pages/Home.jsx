@@ -1,16 +1,17 @@
 import { useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import GameCard from '../components/GameCard';
+import Spotlight from '../components/Spotlight';
 
 const TABS = [
-  { id: 'top',     label: 'Top Rated',      icon: '🏆', url: '/api/reviews/top-games' },
-  { id: 'trending',label: 'Trending',        icon: '🔥', url: '/api/games/trending' },
   { id: 'latest',  label: 'Latest Release',  icon: '✨', url: '/api/games/latest' },
+  { id: 'trending',label: 'Trending',        icon: '🔥', url: '/api/games/trending' },
+  { id: 'top',     label: 'Top Rated',      icon: '🏆', url: '/api/reviews/top-games' },
 ];
 
 export default function Home() {
   // --- Home Tabs State ---
-  const [activeTab, setActiveTab] = useState('top');
+  const [activeTab, setActiveTab] = useState('latest');
   const [tabData, setTabData]     = useState({});
   const [tabError, setTabError]   = useState({});
   const [tabLoading, setTabLoading] = useState({});
@@ -141,6 +142,8 @@ export default function Home() {
       ) : (
         /* HOME TABS (BROWSE MODE) */
         <div className="home-tabs-section">
+          <Spotlight />
+
           <div className="home-tabs">
             {TABS.map((t) => (
               <button

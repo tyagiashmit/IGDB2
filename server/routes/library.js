@@ -21,6 +21,42 @@ async function loadCache() {
 }
 async function saveCache(c) { await fs.writeFile(CACHE_FILE, JSON.stringify(c, null, 2)); }
 
+// IGDB game_type values we treat as reviewable "real games":
+// 0 main_game, 4 standalone_expansion, 8 remake, 9 remaster, 10 expanded_game, 11 port.
+// (Excludes DLC=1, expansion=2, bundle=3, mod=5, episode=6, season=7, pack=13, update=14.)
+// IGDB's old `category` field is deprecated in favour of `game_type`.
+const MAIN_CATEGORIES = '(0,4,8,9,10,11)';
+
+// Strip edition/version suffixes so "Anno 1404: Gold Edition" matches the base game.
+function cleanTitle(name = '') {
+  const cleaned = name
+    .replace(/®|™|©/g, '')
+    .replace(/[:\-–—]?\s*(ultimate|deluxe|gold|complete|definitive|premium|enhanced|legendary|anniversary|collector'?s|special|standard|digital|game of the year|goty)\s+(edition|bundle|collection|pack)\b/gi, '')
+    .replace(/[:\-–—]?\s*(game of the year|goty)\b/gi, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  return cleaned || name;
+}
+
+// Owned-list entries that aren't really games to review (soundtracks, demos, DLC…).
+const JUNK_RE = /(soundtrack|\bost\b|art\s?book|artbook|wallpaper|\bdemo\b|\bsdk\b|dedicated server|season pass|\bdlc\b|bonus content|upgrade pack)/i;
+function isJunk(name = '') { return JUNK_RE.test(name); }
+
+// Collapse duplicate owned entries (base game + its editions) that resolve to the
+// same IGDB game, summing playtime so nothing is lost.
+function dedupeByIgdb(list) {
+  const seen = new Map();
+  const out = [];
+  for (const g of list) {
+    if (g.igdbId == null) { out.push(g); continue; }
+    const existing = seen.get(g.igdbId);
+    if (existing) { existing.playtime = (existing.playtime || 0) + (g.playtime || 0); continue; }
+    seen.set(g.igdbId, g);
+    out.push(g);
+  }
+  return out;
+}
+
 // Fetch Steam owned games sorted by playtime
 async function fetchSteamGames(steamId, apiKey) {
   const { data } = await axios.get(
@@ -31,40 +67,49 @@ async function fetchSteamGames(steamId, apiKey) {
   return games.sort((a, b) => (b.playtime_forever ?? 0) - (a.playtime_forever ?? 0));
 }
 
-// Match a batch of Steam games to IGDB via multiquery (5 games per request)
-async function matchBatch(batch, headers) {
-  const body = batch
-    .map((g, i) => {
-      const safe = g.name.replace(/"/g, '').replace(/[^\w\s\-.:&!]/g, '').trim();
-      return `query games "q${i}" { search "${safe}"; fields id,name,cover.image_id,genres.name,first_release_date; where cover != null; limit 1; };`;
-    })
-    .join('\n');
+const norm = (s = '') => s.toLowerCase().replace(/[^a-z0-9]+/g, '');
 
-  const { data } = await axios.post('https://api.igdb.com/v4/multiquery', body, { headers });
-  return data; // [{ name: "q0", result: [...] }, ...]
+// Search IGDB for one title and return the single best base-game match.
+// NOTE: IGDB's `search` command does NOT work inside /multiquery (it silently
+// returns []), so we query the /games endpoint per title. `search` ranks by
+// relevance; we then prefer an exact name match to the cleaned title so e.g.
+// "ELDEN RING" picks "Elden Ring" over "Elden Ring Nightreign".
+async function searchIgdbGame(rawName, headers) {
+  const cleaned = cleanTitle(rawName);
+  const safe = cleaned.replace(/"/g, '').replace(/[^\w\s\-.:&!]/g, '').trim();
+  if (!safe) return null;
+
+  const body = `search "${safe}"; fields id,name,cover.image_id,genres.name,first_release_date; where cover != null & game_type = ${MAIN_CATEGORIES}; limit 8;`;
+  const { data } = await axios.post('https://api.igdb.com/v4/games', body, { headers });
+  if (!data?.length) return null;
+
+  const target = norm(cleaned);
+  const exact = data.find((g) => norm(g.name) === target);
+  return exact ?? data[0]; // exact title match, else top-ranked result
 }
 
-// Enrich games with IGDB data, caching results
-async function enrichWithIgdb(games, cache) {
+// Enrich a list of owned games with IGDB matches, caching each result.
+// `keyOf` builds the cache key, `nameOf` extracts the title to search.
+// Requests are throttled to stay within IGDB's 4 req/sec limit.
+async function enrichItems(items, cache, keyOf, nameOf) {
   const headers = await getIgdbHeaders();
-  const unmatched = games.filter((g) => !(`steam:${g.appid}` in cache));
-  const toMatch = unmatched.slice(0, 50); // max 50 new matches per call
+  const unmatched = items.filter((g) => !(keyOf(g) in cache));
+  const toMatch = unmatched.slice(0, 50); // cap new matches per call; rest resolve on later loads
 
-  const BATCH = 5;
+  const BATCH = 4; // 4 concurrent + ~1s spacing ≈ 4 req/sec
   for (let i = 0; i < toMatch.length; i += BATCH) {
     const batch = toMatch.slice(i, i + BATCH);
-    try {
-      const results = await matchBatch(batch, headers);
-      batch.forEach((g, idx) => {
-        const hit = results.find((r) => r.name === `q${idx}`)?.result?.[0];
-        cache[`steam:${g.appid}`] = hit
+    await Promise.all(batch.map(async (g) => {
+      try {
+        const hit = await searchIgdbGame(nameOf(g), headers);
+        cache[keyOf(g)] = hit
           ? { igdbId: hit.id, cover: hit.cover?.image_id ?? null, genres: hit.genres?.map((x) => x.name) ?? [], year: hit.first_release_date ? new Date(hit.first_release_date * 1000).getFullYear() : null }
           : null;
-      });
-    } catch {
-      batch.forEach((g) => { cache[`steam:${g.appid}`] = null; });
-    }
-    if (i + BATCH < toMatch.length) await new Promise((r) => setTimeout(r, 300));
+      } catch {
+        cache[keyOf(g)] = null;
+      }
+    }));
+    if (i + BATCH < toMatch.length) await new Promise((r) => setTimeout(r, 1100));
   }
 
   await saveCache(cache);
@@ -72,13 +117,36 @@ async function enrichWithIgdb(games, cache) {
 }
 
 // ── GOG public profile ────────────────────────────────────────────────────────
+// GOG's games/stats endpoint only returns JSON for browser-like XHR requests;
+// plain requests get a 403 from its Cloudflare front. These headers mimic a
+// real in-browser fetch so the public endpoint responds.
+const GOG_HEADERS = (username) => ({
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  'Accept': 'application/json, text/plain, */*',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'X-Requested-With': 'XMLHttpRequest',
+  'Referer': `https://www.gog.com/u/${encodeURIComponent(username)}/games`,
+});
+
 async function fetchGogGames(username) {
-  const { data } = await axios.get(
-    `https://www.gog.com/u/${encodeURIComponent(username)}/games/stats?sort=recent_playtime&order=desc&page=1&format=json`,
-    { headers: { 'User-Agent': 'GameVaultApp/1.0' }, timeout: 8000 }
-  );
+  let data;
+  try {
+    const resp = await axios.get(
+      `https://www.gog.com/u/${encodeURIComponent(username)}/games/stats?sort=recent_playtime&order=desc&page=1`,
+      { headers: GOG_HEADERS(username), timeout: 10000 }
+    );
+    data = resp.data;
+  } catch (err) {
+    const status = err.response?.status;
+    if (status === 403)
+      throw new Error('GOG blocked the request (403). Your GOG profile AND games list must both be set to Public (gog.com → Settings → Privacy). If they already are, GOG may be rate-limiting — wait a minute and retry.');
+    if (status === 404)
+      throw new Error('GOG profile not found. Double-check your GOG username (it is the name in your profile URL, gog.com/u/USERNAME).');
+    throw new Error('Could not reach GOG. Make sure your GOG profile and game list are set to public, then try again.');
+  }
+
   const entries = data?._embedded?.items;
-  if (!entries) throw new Error('GOG profile not found or is private. Make sure your GOG profile and game list are set to public.');
+  if (!entries) throw new Error('GOG profile found, but its games list is private. Set your games list to Public in GOG privacy settings.');
   return entries.map((e) => ({
     id: e.game?.id,
     title: e.game?.title ?? 'Unknown',
@@ -188,11 +256,11 @@ router.get('/steam/games', requireAuth, async (req, res) => {
   if (!steamId) return res.status(400).json({ error: 'Steam account not connected' });
 
   try {
-    const games = await fetchSteamGames(steamId, apiKey);
+    const games = (await fetchSteamGames(steamId, apiKey)).filter((g) => !isJunk(g.name));
     let cache = await loadCache();
-    cache = await enrichWithIgdb(games.slice(0, 200), cache);
+    cache = await enrichItems(games.slice(0, 200), cache, (g) => `steam:${g.appid}`, (g) => g.name);
 
-    const result = games.slice(0, 200).map((g) => {
+    const mapped = games.slice(0, 200).map((g) => {
       const match = cache[`steam:${g.appid}`];
       return {
         appid: g.appid,
@@ -207,7 +275,7 @@ router.get('/steam/games', requireAuth, async (req, res) => {
       };
     });
 
-    res.json(result);
+    res.json(dedupeByIgdb(mapped));
   } catch (err) {
     console.error('steam/games error:', err.message);
     res.status(500).json({ error: err.message });
@@ -252,9 +320,31 @@ router.get('/gog/games', requireAuth, async (req, res) => {
   if (!gogUsername) return res.status(400).json({ error: 'GOG account not connected' });
 
   try {
-    const games = await fetchGogGames(gogUsername);
-    res.json(games);
+    const games = (await fetchGogGames(gogUsername)).filter((g) => !isJunk(g.title));
+    let cache = await loadCache();
+    cache = await enrichItems(games.slice(0, 200), cache, (g) => `gog:${g.id}`, (g) => g.title);
+
+    const mapped = games.slice(0, 200).map((g) => {
+      const match = cache[`gog:${g.id}`];
+      const igdbCover = match?.cover
+        ? `https://images.igdb.com/igdb/image/upload/t_cover_big/${match.cover}.jpg`
+        : null;
+      return {
+        id: g.id,
+        title: g.title,
+        playtime: g.playtime,
+        url: g.url,
+        image: igdbCover ?? g.image,
+        coverUrl: igdbCover ?? g.image,
+        igdbId: match?.igdbId ?? null,
+        genres: match?.genres ?? [],
+        year: match?.year ?? null,
+      };
+    });
+
+    res.json(dedupeByIgdb(mapped));
   } catch (err) {
+    console.error('gog/games error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });

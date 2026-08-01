@@ -5,8 +5,10 @@ import ReviewForm from '../components/ReviewForm';
 import ReviewList from '../components/ReviewList';
 import FavoriteButton from '../components/FavoriteButton';
 import PlatformTagger from '../components/PlatformTagger';
+import LoginGate from '../components/LoginGate';
 import { useAuth } from '../context/AuthContext';
 import { useFavorites } from '../context/FavoritesContext';
+import { useGamification } from '../context/GamificationContext';
 import { coverUrl, screenshotUrl, heroUrl } from '../utils/igdb';
 
 export default function GameDetail() {
@@ -17,8 +19,10 @@ export default function GameDetail() {
   const [error, setError] = useState('');
   const [lightbox, setLightbox] = useState(null);
   const [trailerVideoId, setTrailerVideoId] = useState(null);
+  const [copied, setCopied] = useState(false);
   const { isLoggedIn } = useAuth();
   const { isFavorited } = useFavorites();
+  const { awardView, awardReview } = useGamification();
 
   useEffect(() => {
     async function fetchData() {
@@ -36,6 +40,7 @@ export default function GameDetail() {
         ]);
         setGame(gameData);
         setReviews(reviewData);
+        awardView(id);
       } catch (err) {
         setError(err.message || 'Failed to load game.');
       } finally {
@@ -85,6 +90,24 @@ export default function GameDetail() {
 
   const bestTrailerId = game.videos ? getBestTrailerId(game.videos) : null;
 
+  // Rating distribution across the 1–10 scale for the community bars.
+  const dist = Array.from({ length: 10 }, (_, i) => {
+    const star = 10 - i; // show high scores first
+    return { star, count: reviews.filter((r) => Math.round(r.rating) === star).length };
+  });
+  const maxDist = Math.max(1, ...dist.map((d) => d.count));
+
+  async function handleShare() {
+    const url = window.location.href;
+    const shareData = { title: game.name, text: `Check out ${game.name} on GameVault`, url };
+    try {
+      if (navigator.share) { await navigator.share(shareData); return; }
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch { /* user dismissed share sheet — ignore */ }
+  }
+
   return (
     <div className="detail-page">
       <div className="detail-hero" style={hero ? { backgroundImage: `url(${hero})` } : {}}>
@@ -104,7 +127,7 @@ export default function GameDetail() {
               <div className="meta-item">
                 <span className="meta-label">User Score</span>
                 <div className="score-badge rating-user">
-                  {avgUserRating}<span className="score-unit">/5</span>
+                  {avgUserRating}<span className="score-unit">/10</span>
                 </div>
               </div>
             )}
@@ -190,6 +213,21 @@ export default function GameDetail() {
                 Watch Trailer
               </button>
             )}
+            <button
+              className={`share-btn ${copied ? 'copied' : ''}`}
+              onClick={handleShare}
+              title="Share this game"
+            >
+              {copied ? '✓ Link copied' : (
+                <>
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="18" cy="5" r="3" /><circle cx="6" cy="12" r="3" /><circle cx="18" cy="19" r="3" />
+                    <line x1="8.59" y1="13.51" x2="15.42" y2="17.49" /><line x1="15.41" y1="6.51" x2="8.59" y2="10.49" />
+                  </svg>
+                  Share
+                </>
+              )}
+            </button>
           </div>
 
           {/* Platform Tagger — only shown when game is favorited and user is logged in */}
@@ -246,11 +284,41 @@ export default function GameDetail() {
               {avgUserRating && (
                 <div className="avg-rating">
                   <StarRating value={Math.round(avgUserRating)} readOnly />
-                  <span>{avgUserRating} / 5</span>
+                  <span>{avgUserRating} / 10</span>
                 </div>
               )}
             </div>
-            <ReviewForm gameId={id} onSubmitted={(r) => setReviews((prev) => [r, ...prev])} />
+
+            {reviews.length > 0 && (
+              <div className="rating-summary-big">
+                <div className="rating-summary-score">
+                  {avgUserRating}<small>/10</small>
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div className="rating-dist">
+                    {dist.map((d) => (
+                      <div key={d.star} className="rating-dist-row">
+                        <span className="rating-dist-label">{d.star}★</span>
+                        <span className="rating-dist-track">
+                          <span className="rating-dist-fill" style={{ width: `${(d.count / maxDist) * 100}%` }} />
+                        </span>
+                        <span className="rating-dist-count">{d.count}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <LoginGate
+              title="Create an account to write reviews"
+              message="Sign up free to rate games, earn XP for every review, and climb the leaderboard."
+            >
+              <ReviewForm
+                gameId={id}
+                onSubmitted={(r) => { setReviews((prev) => [r, ...prev]); awardReview(); }}
+              />
+            </LoginGate>
             <ReviewList reviews={reviews} />
           </div>
         </div>

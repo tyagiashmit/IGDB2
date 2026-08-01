@@ -52,8 +52,11 @@ export default function ReviewForm({ gameId, onSubmitted }) {
           />
         </div>
         <div className="form-group">
-          <label className="form-label">Rating</label>
-          <StarRating value={rating} onChange={setRating} />
+          <label className="form-label">Rating {rating > 0 && `— ${rating}/10`}</label>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+            <StarRating value={rating} onChange={setRating} />
+            <span className="rating-value-label">{rating > 0 ? `${rating}/10` : ''}</span>
+          </div>
         </div>
       </div>
       <div className="form-group">

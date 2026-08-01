@@ -316,7 +316,7 @@ function LibraryCard({ game, platform }) {
     </>
   );
 
-  // Link to IGDB game detail if matched, else to store page
+  // Matched to IGDB → open its review page in the app.
   if (game.igdbId) {
     return (
       <div className="game-card-wrap">
@@ -325,13 +325,12 @@ function LibraryCard({ game, platform }) {
     );
   }
 
-  const externalUrl = platform === 'steam'
-    ? `https://store.steampowered.com/app/${game.appid}`
-    : (game.url ?? '#');
-
+  // No IGDB match → keep the user in-app by searching for the title
+  // instead of sending them off to an external storefront.
+  const title = game.name ?? game.title ?? '';
   return (
     <div className="game-card-wrap">
-      <a href={externalUrl} target="_blank" rel="noopener noreferrer" className="game-card">{inner}</a>
+      <Link to={`/?q=${encodeURIComponent(title)}`} className="game-card">{inner}</Link>
     </div>
   );
 }

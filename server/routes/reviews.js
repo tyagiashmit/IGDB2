@@ -77,7 +77,7 @@ router.post('/:gameId', async (req, res) => {
     return res.status(400).json({ error: 'author, rating, and content are required' });
   }
   const r = Number(rating);
-  if (r < 1 || r > 5) return res.status(400).json({ error: 'rating must be 1–5' });
+  if (r < 1 || r > 10) return res.status(400).json({ error: 'rating must be 1–10' });
 
   const db = await load();
   const gid = req.params.gameId;

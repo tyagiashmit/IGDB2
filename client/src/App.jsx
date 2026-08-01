@@ -1,12 +1,14 @@
 import { Routes, Route } from 'react-router-dom';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { FavoritesProvider } from './context/FavoritesContext';
+import { GamificationProvider } from './context/GamificationContext';
 import AuthModal from './components/AuthModal';
 import Navbar from './components/Navbar';
 import Home from './pages/Home';
 import GameDetail from './pages/GameDetail';
 import Favorites from './pages/Favorites';
 import Library from './pages/Library';
+import Profile from './pages/Profile';
 
 import { useState, useEffect } from 'react';
 
@@ -24,6 +26,7 @@ function AppShell() {
           <Route path="/game/:id" element={<GameDetail />} />
           <Route path="/favorites" element={<Favorites />} />
           <Route path="/library" element={<Library />} />
+          <Route path="/profile" element={<Profile />} />
         </Routes>
       </main>
       {showLoginModal && <AuthModal onClose={() => setShowLoginModal(false)} />}
@@ -35,7 +38,9 @@ export default function App() {
   return (
     <AuthProvider>
       <FavoritesProvider>
-        <AppShell />
+        <GamificationProvider>
+          <AppShell />
+        </GamificationProvider>
       </FavoritesProvider>
     </AuthProvider>
   );

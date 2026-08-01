@@ -11,13 +11,18 @@ const LIST_FIELDS = `
          first_release_date;
 `.trim();
 
+// Only surface reviewable "real games" — exclude DLC, bundles, packs, editions, etc.
+// game_type: 0 main_game, 4 standalone_expansion, 8 remake, 9 remaster, 10 expanded_game, 11 port.
+// (IGDB's old `category` field is deprecated in favour of `game_type`.)
+const MAIN_CATEGORIES = 'game_type = (0,4,8,9,10,11)';
+
 router.get('/top', async (req, res) => {
   try {
     const headers = await getIgdbHeaders();
     const { data } = await axios.post(
       `${IGDB}/games`,
       `${LIST_FIELDS}
-       where rating != null & cover != null & rating_count > 30;
+       where rating != null & cover != null & rating_count > 30 & ${MAIN_CATEGORIES};
        sort rating desc;
        limit 20;`,
       { headers }
@@ -36,7 +41,7 @@ router.get('/trending', async (req, res) => {
     const { data } = await axios.post(
       `${IGDB}/games`,
       `${LIST_FIELDS}
-       where first_release_date > ${oneYearAgo} & cover != null;
+       where first_release_date > ${oneYearAgo} & cover != null & ${MAIN_CATEGORIES};
        sort first_release_date desc;
        limit 20;`,
       { headers }
@@ -56,7 +61,7 @@ router.get('/latest', async (req, res) => {
     const { data } = await axios.post(
       `${IGDB}/games`,
       `${LIST_FIELDS}
-       where first_release_date > ${threeMonthsAgo} & first_release_date < ${now} & cover != null;
+       where first_release_date > ${threeMonthsAgo} & first_release_date < ${now} & cover != null & ${MAIN_CATEGORIES};
        sort first_release_date desc;
        limit 20;`,
       { headers }
@@ -74,7 +79,7 @@ router.get('/search', async (req, res) => {
   try {
     const headers = await getIgdbHeaders();
     let queryBody = LIST_FIELDS;
-    let conditions = ['cover != null'];
+    let conditions = ['cover != null', MAIN_CATEGORIES];
 
     if (q?.trim()) {
       const safe = q.replace(/"/g, '');

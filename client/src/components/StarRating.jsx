@@ -1,12 +1,12 @@
 import { useState } from 'react';
 
-export default function StarRating({ value, onChange, readOnly = false }) {
+export default function StarRating({ value, onChange, readOnly = false, max = 10 }) {
   const [hovered, setHovered] = useState(0);
   const display = hovered || value;
 
   return (
     <div className={`stars ${readOnly ? 'stars-readonly' : 'stars-interactive'}`}>
-      {[1, 2, 3, 4, 5].map((n) => (
+      {Array.from({ length: max }, (_, i) => i + 1).map((n) => (
         <button
           key={n}
           type="button"
