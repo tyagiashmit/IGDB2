@@ -88,34 +88,74 @@ async function searchIgdbGame(rawName, headers) {
   return exact ?? data[0]; // exact title match, else top-ranked result
 }
 
-// Enrich a list of owned games with IGDB matches, caching each result.
-// `keyOf` builds the cache key, `nameOf` extracts the title to search.
-// Requests are throttled to stay within IGDB's 4 req/sec limit.
-async function enrichItems(items, cache, keyOf, nameOf) {
-  const headers = await getIgdbHeaders();
-  const unmatched = items.filter((g) => !(keyOf(g) in cache));
-  const toMatch = unmatched.slice(0, 50); // cap new matches per call; rest resolve on later loads
+const toCacheEntry = (hit) => ({
+  igdbId: hit.id,
+  cover: hit.cover?.image_id ?? null,
+  genres: hit.genres?.map((x) => x.name) ?? [],
+  year: hit.first_release_date ? new Date(hit.first_release_date * 1000).getFullYear() : null,
+});
 
-  const BATCH = 4; // IGDB allows ~4 requests/sec — fire 4 at a time, one burst per second
-  for (let i = 0; i < toMatch.length; i += BATCH) {
+// Fast path: match up to 10 titles in ONE multiquery via IGDB's case-insensitive
+// EXACT name operator (`name ~ "title"`). `search` doesn't work in multiquery, but
+// exact-name does — and it resolves the base game for most titles in one request.
+async function matchExactBatch(chunk, nameOf, headers) {
+  const body = chunk.map((g, i) => {
+    // Preserve apostrophes/colons for exact matching, but strip characters that
+    // would break the apicalypse query. Empty titles get a sentinel (→ no match).
+    const term = cleanTitle(nameOf(g)).replace(/["\\;{}\r\n]/g, '').trim() || '__nomatch__';
+    return `query games "q${i}" { fields id,name,cover.image_id,genres.name,first_release_date; where name ~ "${term}" & cover != null & game_type = ${MAIN_CATEGORIES}; limit 1; };`;
+  }).join('\n');
+  const { data } = await axios.post('https://api.igdb.com/v4/multiquery', body, { headers });
+  return data; // [{ name: "q0", result: [...] }, ...]
+}
+
+// Run async work in rate-limited waves (≈4 IGDB requests/sec).
+async function inWaves(list, size, worker) {
+  for (let i = 0; i < list.length; i += size) {
     const started = Date.now();
-    const batch = toMatch.slice(i, i + BATCH);
-    await Promise.all(batch.map(async (g) => {
-      try {
-        const hit = await searchIgdbGame(nameOf(g), headers);
-        cache[keyOf(g)] = hit
-          ? { igdbId: hit.id, cover: hit.cover?.image_id ?? null, genres: hit.genres?.map((x) => x.name) ?? [], year: hit.first_release_date ? new Date(hit.first_release_date * 1000).getFullYear() : null }
-          : null;
-      } catch {
-        cache[keyOf(g)] = null;
-      }
-    }));
-    // Keep batch starts ~1s apart (subtract time the requests already took).
-    if (i + BATCH < toMatch.length) {
+    await Promise.all(list.slice(i, i + size).map(worker));
+    if (i + size < list.length) {
       const wait = Math.max(0, 1000 - (Date.now() - started));
       if (wait) await new Promise((r) => setTimeout(r, wait));
     }
   }
+}
+
+// Enrich owned games with IGDB matches, caching each result. Two passes:
+//   1) batched exact-name matching (10 games/request) — fast, handles most titles
+//   2) per-game relevance `search` for the leftovers — accurate, slower
+async function enrichItems(items, cache, keyOf, nameOf) {
+  const headers = await getIgdbHeaders();
+  const unmatched = items.filter((g) => !(keyOf(g) in cache)).slice(0, 200);
+  if (!unmatched.length) return cache;
+
+  // ── Pass 1: fast batched exact-name matching ──
+  const misses = [];
+  const chunks = [];
+  for (let i = 0; i < unmatched.length; i += 10) chunks.push(unmatched.slice(i, i + 10));
+
+  await inWaves(chunks, 4, async (chunk) => {
+    try {
+      const results = await matchExactBatch(chunk, nameOf, headers);
+      chunk.forEach((g, idx) => {
+        const hit = results.find((r) => r.name === `q${idx}`)?.result?.[0];
+        if (hit) cache[keyOf(g)] = toCacheEntry(hit);
+        else misses.push(g);
+      });
+    } catch {
+      misses.push(...chunk); // whole batch failed → try the search fallback
+    }
+  });
+
+  // ── Pass 2: accurate per-game search fallback (bounded to keep loads snappy) ──
+  await inWaves(misses.slice(0, 60), 4, async (g) => {
+    try {
+      const hit = await searchIgdbGame(nameOf(g), headers);
+      cache[keyOf(g)] = hit ? toCacheEntry(hit) : null;
+    } catch {
+      cache[keyOf(g)] = null;
+    }
+  });
 
   await saveCache(cache);
   return cache;
