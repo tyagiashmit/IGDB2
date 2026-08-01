@@ -1,0 +1,20 @@
+[
+  {
+    "id": "1785043649136-70dad",
+    "username": "testuser1",
+    "password": "$2a$10$MCRRRHAWPivHK70k.OdRGeVhcfa23z0Ot5Srni/fnPtU5kITEUGpi",
+    "createdAt": "2026-07-26T05:27:29.136Z"
+  },
+  {
+    "id": "1785047977742-wnn4o",
+    "username": "testuser123",
+    "password": "$2a$10$bu5Pp1qk9D4oIewVITYmQuk7W60g0Tb/ZU9YFQZr7OamvcYcxaSv.",
+    "createdAt": "2026-07-26T06:39:37.742Z"
+  },
+  {
+    "id": "1785166691986-lewyq",
+    "username": "testuser12",
+    "password": "$2a$10$ex4IX6X/vTUgdQfZDZU4Ge0UqJqNkAMPPj7Q/Jn/OaSy0UDBkG2Fy",
+    "createdAt": "2026-07-27T15:38:11.986Z"
+  }
+]
