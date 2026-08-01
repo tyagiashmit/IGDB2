@@ -57,6 +57,35 @@ function dedupeByIgdb(list) {
   return out;
 }
 
+// ── Resolved-library response cache (in-memory, per user+platform) ─────────────
+// Skips all the platform round-trips (especially Epic's catalog resolution) on
+// repeat visits. `?refresh=1` bypasses it (the client's Refresh button).
+const LIST_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const listCache = new Map(); // `${userId}:${platform}` -> { games, at }
+const listKey = (userId, platform) => `${userId}:${platform}`;
+const invalidateList = (userId, platform) => listCache.delete(listKey(userId, platform));
+
+// Serve a platform's games with TTL caching. `build` produces the games array
+// on a cache miss / forced refresh; on build failure we fall back to any cached
+// list so a hiccup never blanks the user's library.
+async function servedLibrary(req, res, platform, build) {
+  const key = listKey(req.user.id, platform);
+  const force = req.query.refresh === '1' || req.query.refresh === 'true';
+  const cached = listCache.get(key);
+  if (!force && cached && Date.now() - cached.at < LIST_TTL_MS) {
+    return res.json(cached.games);
+  }
+  try {
+    const games = await build();
+    listCache.set(key, { games, at: Date.now() });
+    res.json(games);
+  } catch (err) {
+    if (cached) return res.json(cached.games); // serve stale rather than error
+    console.error(`${platform}/games error:`, err.message);
+    res.status(err.statusCode ?? 500).json({ error: err.message });
+  }
+}
+
 // Fetch Steam owned games sorted by playtime
 async function fetchSteamGames(steamId, apiKey) {
   const { data } = await axios.get(
@@ -276,6 +305,7 @@ router.get('/steam/callback', async (req, res) => {
   users[idx].connectedAccounts ??= {};
   users[idx].connectedAccounts.steam = { steamId, connectedAt: new Date().toISOString() };
   await saveUsers(users);
+  invalidateList(auth.userId, 'steam');
 
   res.redirect(`${FRONTEND}/library?steam=connected`);
 });
@@ -288,6 +318,7 @@ router.delete('/steam', requireAuth, async (req, res) => {
     delete users[idx].connectedAccounts?.steam;
     await saveUsers(users);
   }
+  invalidateList(req.user.id, 'steam');
   res.json({ ok: true });
 });
 
@@ -300,7 +331,7 @@ router.get('/steam/games', requireAuth, async (req, res) => {
   const steamId = user?.connectedAccounts?.steam?.steamId;
   if (!steamId) return res.status(400).json({ error: 'Steam account not connected' });
 
-  try {
+  await servedLibrary(req, res, 'steam', async () => {
     const games = (await fetchSteamGames(steamId, apiKey)).filter((g) => !isJunk(g.name));
     let cache = await loadCache();
     cache = await enrichItems(games.slice(0, 200), cache, (g) => `steam:${g.appid}`, (g) => g.name);
@@ -320,11 +351,8 @@ router.get('/steam/games', requireAuth, async (req, res) => {
       };
     });
 
-    res.json(dedupeByIgdb(mapped));
-  } catch (err) {
-    console.error('steam/games error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+    return dedupeByIgdb(mapped);
+  });
 });
 
 // ── GOG ───────────────────────────────────────────────────────────────────────
@@ -345,6 +373,7 @@ router.put('/gog', requireAuth, async (req, res) => {
   users[idx].connectedAccounts ??= {};
   users[idx].connectedAccounts.gog = { username: gogUsername.trim(), connectedAt: new Date().toISOString() };
   await saveUsers(users);
+  invalidateList(req.user.id, 'gog');
   res.json({ username: gogUsername.trim() });
 });
 
@@ -355,6 +384,7 @@ router.delete('/gog', requireAuth, async (req, res) => {
     delete users[idx].connectedAccounts?.gog;
     await saveUsers(users);
   }
+  invalidateList(req.user.id, 'gog');
   res.json({ ok: true });
 });
 
@@ -364,7 +394,7 @@ router.get('/gog/games', requireAuth, async (req, res) => {
   const gogUsername = user?.connectedAccounts?.gog?.username;
   if (!gogUsername) return res.status(400).json({ error: 'GOG account not connected' });
 
-  try {
+  await servedLibrary(req, res, 'gog', async () => {
     const games = (await fetchGogGames(gogUsername)).filter((g) => !isJunk(g.title));
     let cache = await loadCache();
     cache = await enrichItems(games.slice(0, 200), cache, (g) => `gog:${g.id}`, (g) => g.title);
@@ -387,11 +417,8 @@ router.get('/gog/games', requireAuth, async (req, res) => {
       };
     });
 
-    res.json(dedupeByIgdb(mapped));
-  } catch (err) {
-    console.error('gog/games error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+    return dedupeByIgdb(mapped);
+  });
 });
 
 // ── Xbox (via OpenXBL / xbl.io) ────────────────────────────────────────────────
@@ -449,6 +476,7 @@ router.put('/xbox', requireAuth, async (req, res) => {
   users[idx].connectedAccounts ??= {};
   users[idx].connectedAccounts.xbox = { apiKey: apiKey.trim(), xuid: profile.xuid, gamertag: profile.gamertag, connectedAt: new Date().toISOString() };
   await saveUsers(users);
+  invalidateList(req.user.id, 'xbox');
   res.json({ gamertag: profile.gamertag });
 });
 
@@ -456,6 +484,7 @@ router.delete('/xbox', requireAuth, async (req, res) => {
   const users = await loadUsers();
   const idx = users.findIndex((u) => u.id === req.user.id);
   if (idx !== -1) { delete users[idx].connectedAccounts?.xbox; await saveUsers(users); }
+  invalidateList(req.user.id, 'xbox');
   res.json({ ok: true });
 });
 
@@ -465,7 +494,7 @@ router.get('/xbox/games', requireAuth, async (req, res) => {
   const xbox  = user?.connectedAccounts?.xbox;
   if (!xbox?.apiKey) return res.status(400).json({ error: 'Xbox account not connected' });
 
-  try {
+  await servedLibrary(req, res, 'xbox', async () => {
     const titles = (await fetchXboxTitles(xbox.apiKey)).filter((t) => t.name && !isJunk(t.name));
     let cache = await loadCache();
     cache = await enrichItems(titles.slice(0, 200), cache, (g) => `xbox:${g.titleId}`, (g) => g.name);
@@ -485,11 +514,8 @@ router.get('/xbox/games', requireAuth, async (req, res) => {
       };
     });
 
-    res.json(dedupeByIgdb(mapped));
-  } catch (err) {
-    console.error('xbox/games error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+    return dedupeByIgdb(mapped);
+  });
 });
 
 // ── Epic Games (unofficial launcher auth, à la Legendary/Heroic) ────────────────
@@ -592,6 +618,7 @@ router.put('/epic', requireAuth, async (req, res) => {
     connectedAt: new Date().toISOString(),
   };
   await saveUsers(users);
+  invalidateList(req.user.id, 'epic');
   res.json({ displayName: token.displayName ?? 'Epic Player' });
 });
 
@@ -599,6 +626,7 @@ router.delete('/epic', requireAuth, async (req, res) => {
   const users = await loadUsers();
   const idx = users.findIndex((u) => u.id === req.user.id);
   if (idx !== -1) { delete users[idx].connectedAccounts?.epic; await saveUsers(users); }
+  invalidateList(req.user.id, 'epic');
   res.json({ ok: true });
 });
 
@@ -608,18 +636,20 @@ router.get('/epic/games', requireAuth, async (req, res) => {
   const epic = users[idx]?.connectedAccounts?.epic;
   if (!epic?.refreshToken) return res.status(400).json({ error: 'Epic account not connected' });
 
-  let accessToken;
-  try {
-    const token = await epicToken({ grant_type: 'refresh_token', refresh_token: epic.refreshToken, token_type: 'eg1' });
-    accessToken = token.access_token;
-    // Persist the rotated refresh token so future refreshes keep working.
-    users[idx].connectedAccounts.epic.refreshToken = token.refresh_token;
-    await saveUsers(users);
-  } catch {
-    return res.status(400).json({ error: 'Epic session expired. Please reconnect your Epic account.' });
-  }
+  await servedLibrary(req, res, 'epic', async () => {
+    // Token refresh only runs on a cache miss / forced refresh.
+    let accessToken;
+    try {
+      const token = await epicToken({ grant_type: 'refresh_token', refresh_token: epic.refreshToken, token_type: 'eg1' });
+      accessToken = token.access_token;
+      users[idx].connectedAccounts.epic.refreshToken = token.refresh_token; // rotate
+      await saveUsers(users);
+    } catch {
+      const e = new Error('Epic session expired. Please reconnect your Epic account.');
+      e.statusCode = 400;
+      throw e;
+    }
 
-  try {
     const owned = (await epicFetchLibrary(accessToken)).filter((g) => g.title && !isJunk(g.title));
     let cache = await loadCache();
     cache = await enrichItems(owned.slice(0, 200), cache, (g) => `epic:${g.id}`, (g) => g.title);
@@ -639,11 +669,8 @@ router.get('/epic/games', requireAuth, async (req, res) => {
       };
     });
 
-    res.json(dedupeByIgdb(mapped));
-  } catch (err) {
-    console.error('epic/games error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+    return dedupeByIgdb(mapped);
+  });
 });
 
 export default router;
