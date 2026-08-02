@@ -108,13 +108,17 @@ async function searchIgdbGame(rawName, headers) {
   const safe = cleaned.replace(/"/g, '').replace(/[^\w\s\-.:&!]/g, '').trim();
   if (!safe) return null;
 
-  const body = `search "${safe}"; fields id,name,cover.image_id,genres.name,first_release_date; where cover != null & game_type = ${MAIN_CATEGORIES}; limit 8;`;
+  const body = `search "${safe}"; fields id,name,cover.image_id,genres.name,first_release_date,total_rating_count; where cover != null & game_type = ${MAIN_CATEGORIES}; limit 10;`;
   const { data } = await axios.post('https://api.igdb.com/v4/games', body, { headers });
   if (!data?.length) return null;
 
   const target = norm(cleaned);
-  const exact = data.find((g) => norm(g.name) === target);
-  return exact ?? data[0]; // exact title match, else top-ranked result
+  const exacts = data.filter((g) => norm(g.name) === target);
+  // Multiple entries with the same name = regional variants; prefer most-rated (primary release).
+  if (exacts.length > 1) {
+    return exacts.reduce((best, cur) => ((cur.total_rating_count ?? 0) > (best.total_rating_count ?? 0) ? cur : best));
+  }
+  return exacts[0] ?? data[0];
 }
 
 const toCacheEntry = (hit) => ({
@@ -127,15 +131,23 @@ const toCacheEntry = (hit) => ({
 // Fast path: match up to 10 titles in ONE multiquery via IGDB's case-insensitive
 // EXACT name operator (`name ~ "title"`). `search` doesn't work in multiquery, but
 // exact-name does — and it resolves the base game for most titles in one request.
+// We fetch limit 3 per sub-query so that when a game has multiple IGDB entries with
+// the same name (e.g. regional versions like Tencent-published Fortnite vs the Epic
+// original), we can pick the one with the most community ratings — the primary release.
 async function matchExactBatch(chunk, nameOf, headers) {
   const body = chunk.map((g, i) => {
-    // Preserve apostrophes/colons for exact matching, but strip characters that
-    // would break the apicalypse query. Empty titles get a sentinel (→ no match).
     const term = cleanTitle(nameOf(g)).replace(/["\\;{}\r\n]/g, '').trim() || '__nomatch__';
-    return `query games "q${i}" { fields id,name,cover.image_id,genres.name,first_release_date; where name ~ "${term}" & cover != null & game_type = ${MAIN_CATEGORIES}; limit 1; };`;
+    return `query games "q${i}" { fields id,name,cover.image_id,genres.name,first_release_date,total_rating_count; where name ~ "${term}" & cover != null & game_type = ${MAIN_CATEGORIES}; limit 3; };`;
   }).join('\n');
   const { data } = await axios.post('https://api.igdb.com/v4/multiquery', body, { headers });
-  return data; // [{ name: "q0", result: [...] }, ...]
+  // Normalise: reduce each sub-query's result to a single best entry so callers
+  // can still use result[0] — pick highest total_rating_count when there are ties.
+  return data.map((q) => ({
+    ...q,
+    result: q.result?.length > 1
+      ? [q.result.reduce((best, cur) => ((cur.total_rating_count ?? 0) > (best.total_rating_count ?? 0) ? cur : best))]
+      : q.result,
+  }));
 }
 
 // Run async work in rate-limited waves (≈4 IGDB requests/sec).
