@@ -111,12 +111,12 @@ function PlatformPanel({ platform, account, onAccountChange, authFetch }) {
     return () => { reqId.current++; }; // invalidate in-flight request on unmount/re-run
   }, [account, platform]);
 
-  async function loadGames() {
+  async function loadGames(force = false) {
     const myReq = ++reqId.current;
     setLoading(true);
     setError('');
     try {
-      const res = await authFetch(`/api/library/${platform}/games`);
+      const res = await authFetch(`/api/library/${platform}/games${force ? '?refresh=1' : ''}`);
       const data = await res.json();
       if (myReq !== reqId.current) return; // a newer request started — drop this result
       if (!res.ok) throw new Error(data.error);
@@ -156,7 +156,7 @@ function PlatformPanel({ platform, account, onAccountChange, authFetch }) {
             : 'Connected'}
         </span>
         <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
-          <button className="btn-ghost" onClick={loadGames} disabled={loading}>↺ Refresh</button>
+          <button className="btn-ghost" onClick={() => loadGames(true)} disabled={loading}>↺ Refresh</button>
           <button className="btn-ghost btn-ghost-danger" onClick={disconnect}>Disconnect</button>
         </div>
       </div>
@@ -164,7 +164,7 @@ function PlatformPanel({ platform, account, onAccountChange, authFetch }) {
       {error && (
         <div className="error-banner" style={{ marginBottom: '1.5rem' }}>
           <span>{error}</span>
-          <button className="retry-btn" onClick={loadGames}>Retry</button>
+          <button className="retry-btn" onClick={() => loadGames(true)}>Retry</button>
         </div>
       )}
 

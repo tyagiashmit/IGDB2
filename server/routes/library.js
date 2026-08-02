@@ -57,6 +57,35 @@ function dedupeByIgdb(list) {
   return out;
 }
 
+// ── Resolved-library response cache (in-memory, per user+platform) ─────────────
+// Skips all the platform round-trips (especially Epic's catalog resolution) on
+// repeat visits. `?refresh=1` bypasses it (the client's Refresh button).
+const LIST_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const listCache = new Map(); // `${userId}:${platform}` -> { games, at }
+const listKey = (userId, platform) => `${userId}:${platform}`;
+const invalidateList = (userId, platform) => listCache.delete(listKey(userId, platform));
+
+// Serve a platform's games with TTL caching. `build` produces the games array
+// on a cache miss / forced refresh; on build failure we fall back to any cached
+// list so a hiccup never blanks the user's library.
+async function servedLibrary(req, res, platform, build) {
+  const key = listKey(req.user.id, platform);
+  const force = req.query.refresh === '1' || req.query.refresh === 'true';
+  const cached = listCache.get(key);
+  if (!force && cached && Date.now() - cached.at < LIST_TTL_MS) {
+    return res.json(cached.games);
+  }
+  try {
+    const games = await build();
+    listCache.set(key, { games, at: Date.now() });
+    res.json(games);
+  } catch (err) {
+    if (cached) return res.json(cached.games); // serve stale rather than error
+    console.error(`${platform}/games error:`, err.message);
+    res.status(err.statusCode ?? 500).json({ error: err.message });
+  }
+}
+
 // Fetch Steam owned games sorted by playtime
 async function fetchSteamGames(steamId, apiKey) {
   const { data } = await axios.get(
@@ -79,43 +108,95 @@ async function searchIgdbGame(rawName, headers) {
   const safe = cleaned.replace(/"/g, '').replace(/[^\w\s\-.:&!]/g, '').trim();
   if (!safe) return null;
 
-  const body = `search "${safe}"; fields id,name,cover.image_id,genres.name,first_release_date; where cover != null & game_type = ${MAIN_CATEGORIES}; limit 8;`;
+  const body = `search "${safe}"; fields id,name,cover.image_id,genres.name,first_release_date,total_rating_count; where cover != null & game_type = ${MAIN_CATEGORIES}; limit 10;`;
   const { data } = await axios.post('https://api.igdb.com/v4/games', body, { headers });
   if (!data?.length) return null;
 
   const target = norm(cleaned);
-  const exact = data.find((g) => norm(g.name) === target);
-  return exact ?? data[0]; // exact title match, else top-ranked result
+  const exacts = data.filter((g) => norm(g.name) === target);
+  // Multiple entries with the same name = regional variants; prefer most-rated (primary release).
+  if (exacts.length > 1) {
+    return exacts.reduce((best, cur) => ((cur.total_rating_count ?? 0) > (best.total_rating_count ?? 0) ? cur : best));
+  }
+  return exacts[0] ?? data[0];
 }
 
-// Enrich a list of owned games with IGDB matches, caching each result.
-// `keyOf` builds the cache key, `nameOf` extracts the title to search.
-// Requests are throttled to stay within IGDB's 4 req/sec limit.
-async function enrichItems(items, cache, keyOf, nameOf) {
-  const headers = await getIgdbHeaders();
-  const unmatched = items.filter((g) => !(keyOf(g) in cache));
-  const toMatch = unmatched.slice(0, 50); // cap new matches per call; rest resolve on later loads
+const toCacheEntry = (hit) => ({
+  igdbId: hit.id,
+  cover: hit.cover?.image_id ?? null,
+  genres: hit.genres?.map((x) => x.name) ?? [],
+  year: hit.first_release_date ? new Date(hit.first_release_date * 1000).getFullYear() : null,
+});
 
-  const BATCH = 4; // IGDB allows ~4 requests/sec — fire 4 at a time, one burst per second
-  for (let i = 0; i < toMatch.length; i += BATCH) {
+// Fast path: match up to 10 titles in ONE multiquery via IGDB's case-insensitive
+// EXACT name operator (`name ~ "title"`). `search` doesn't work in multiquery, but
+// exact-name does — and it resolves the base game for most titles in one request.
+// We fetch limit 3 per sub-query so that when a game has multiple IGDB entries with
+// the same name (e.g. regional versions like Tencent-published Fortnite vs the Epic
+// original), we can pick the one with the most community ratings — the primary release.
+async function matchExactBatch(chunk, nameOf, headers) {
+  const body = chunk.map((g, i) => {
+    const term = cleanTitle(nameOf(g)).replace(/["\\;{}\r\n]/g, '').trim() || '__nomatch__';
+    return `query games "q${i}" { fields id,name,cover.image_id,genres.name,first_release_date,total_rating_count; where name ~ "${term}" & cover != null & game_type = ${MAIN_CATEGORIES}; limit 3; };`;
+  }).join('\n');
+  const { data } = await axios.post('https://api.igdb.com/v4/multiquery', body, { headers });
+  // Normalise: reduce each sub-query's result to a single best entry so callers
+  // can still use result[0] — pick highest total_rating_count when there are ties.
+  return data.map((q) => ({
+    ...q,
+    result: q.result?.length > 1
+      ? [q.result.reduce((best, cur) => ((cur.total_rating_count ?? 0) > (best.total_rating_count ?? 0) ? cur : best))]
+      : q.result,
+  }));
+}
+
+// Run async work in rate-limited waves (≈4 IGDB requests/sec).
+async function inWaves(list, size, worker) {
+  for (let i = 0; i < list.length; i += size) {
     const started = Date.now();
-    const batch = toMatch.slice(i, i + BATCH);
-    await Promise.all(batch.map(async (g) => {
-      try {
-        const hit = await searchIgdbGame(nameOf(g), headers);
-        cache[keyOf(g)] = hit
-          ? { igdbId: hit.id, cover: hit.cover?.image_id ?? null, genres: hit.genres?.map((x) => x.name) ?? [], year: hit.first_release_date ? new Date(hit.first_release_date * 1000).getFullYear() : null }
-          : null;
-      } catch {
-        cache[keyOf(g)] = null;
-      }
-    }));
-    // Keep batch starts ~1s apart (subtract time the requests already took).
-    if (i + BATCH < toMatch.length) {
+    await Promise.all(list.slice(i, i + size).map(worker));
+    if (i + size < list.length) {
       const wait = Math.max(0, 1000 - (Date.now() - started));
       if (wait) await new Promise((r) => setTimeout(r, wait));
     }
   }
+}
+
+// Enrich owned games with IGDB matches, caching each result. Two passes:
+//   1) batched exact-name matching (10 games/request) — fast, handles most titles
+//   2) per-game relevance `search` for the leftovers — accurate, slower
+async function enrichItems(items, cache, keyOf, nameOf) {
+  const headers = await getIgdbHeaders();
+  const unmatched = items.filter((g) => !(keyOf(g) in cache)).slice(0, 200);
+  if (!unmatched.length) return cache;
+
+  // ── Pass 1: fast batched exact-name matching ──
+  const misses = [];
+  const chunks = [];
+  for (let i = 0; i < unmatched.length; i += 10) chunks.push(unmatched.slice(i, i + 10));
+
+  await inWaves(chunks, 4, async (chunk) => {
+    try {
+      const results = await matchExactBatch(chunk, nameOf, headers);
+      chunk.forEach((g, idx) => {
+        const hit = results.find((r) => r.name === `q${idx}`)?.result?.[0];
+        if (hit) cache[keyOf(g)] = toCacheEntry(hit);
+        else misses.push(g);
+      });
+    } catch {
+      misses.push(...chunk); // whole batch failed → try the search fallback
+    }
+  });
+
+  // ── Pass 2: accurate per-game search fallback (bounded to keep loads snappy) ──
+  await inWaves(misses.slice(0, 60), 4, async (g) => {
+    try {
+      const hit = await searchIgdbGame(nameOf(g), headers);
+      cache[keyOf(g)] = hit ? toCacheEntry(hit) : null;
+    } catch {
+      cache[keyOf(g)] = null;
+    }
+  });
 
   await saveCache(cache);
   return cache;
@@ -236,6 +317,7 @@ router.get('/steam/callback', async (req, res) => {
   users[idx].connectedAccounts ??= {};
   users[idx].connectedAccounts.steam = { steamId, connectedAt: new Date().toISOString() };
   await saveUsers(users);
+  invalidateList(auth.userId, 'steam');
 
   res.redirect(`${FRONTEND}/library?steam=connected`);
 });
@@ -248,6 +330,7 @@ router.delete('/steam', requireAuth, async (req, res) => {
     delete users[idx].connectedAccounts?.steam;
     await saveUsers(users);
   }
+  invalidateList(req.user.id, 'steam');
   res.json({ ok: true });
 });
 
@@ -260,7 +343,7 @@ router.get('/steam/games', requireAuth, async (req, res) => {
   const steamId = user?.connectedAccounts?.steam?.steamId;
   if (!steamId) return res.status(400).json({ error: 'Steam account not connected' });
 
-  try {
+  await servedLibrary(req, res, 'steam', async () => {
     const games = (await fetchSteamGames(steamId, apiKey)).filter((g) => !isJunk(g.name));
     let cache = await loadCache();
     cache = await enrichItems(games.slice(0, 200), cache, (g) => `steam:${g.appid}`, (g) => g.name);
@@ -280,11 +363,8 @@ router.get('/steam/games', requireAuth, async (req, res) => {
       };
     });
 
-    res.json(dedupeByIgdb(mapped));
-  } catch (err) {
-    console.error('steam/games error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+    return dedupeByIgdb(mapped);
+  });
 });
 
 // ── GOG ───────────────────────────────────────────────────────────────────────
@@ -305,6 +385,7 @@ router.put('/gog', requireAuth, async (req, res) => {
   users[idx].connectedAccounts ??= {};
   users[idx].connectedAccounts.gog = { username: gogUsername.trim(), connectedAt: new Date().toISOString() };
   await saveUsers(users);
+  invalidateList(req.user.id, 'gog');
   res.json({ username: gogUsername.trim() });
 });
 
@@ -315,6 +396,7 @@ router.delete('/gog', requireAuth, async (req, res) => {
     delete users[idx].connectedAccounts?.gog;
     await saveUsers(users);
   }
+  invalidateList(req.user.id, 'gog');
   res.json({ ok: true });
 });
 
@@ -324,7 +406,7 @@ router.get('/gog/games', requireAuth, async (req, res) => {
   const gogUsername = user?.connectedAccounts?.gog?.username;
   if (!gogUsername) return res.status(400).json({ error: 'GOG account not connected' });
 
-  try {
+  await servedLibrary(req, res, 'gog', async () => {
     const games = (await fetchGogGames(gogUsername)).filter((g) => !isJunk(g.title));
     let cache = await loadCache();
     cache = await enrichItems(games.slice(0, 200), cache, (g) => `gog:${g.id}`, (g) => g.title);
@@ -347,11 +429,8 @@ router.get('/gog/games', requireAuth, async (req, res) => {
       };
     });
 
-    res.json(dedupeByIgdb(mapped));
-  } catch (err) {
-    console.error('gog/games error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+    return dedupeByIgdb(mapped);
+  });
 });
 
 // ── Xbox (via OpenXBL / xbl.io) ────────────────────────────────────────────────
@@ -409,6 +488,7 @@ router.put('/xbox', requireAuth, async (req, res) => {
   users[idx].connectedAccounts ??= {};
   users[idx].connectedAccounts.xbox = { apiKey: apiKey.trim(), xuid: profile.xuid, gamertag: profile.gamertag, connectedAt: new Date().toISOString() };
   await saveUsers(users);
+  invalidateList(req.user.id, 'xbox');
   res.json({ gamertag: profile.gamertag });
 });
 
@@ -416,6 +496,7 @@ router.delete('/xbox', requireAuth, async (req, res) => {
   const users = await loadUsers();
   const idx = users.findIndex((u) => u.id === req.user.id);
   if (idx !== -1) { delete users[idx].connectedAccounts?.xbox; await saveUsers(users); }
+  invalidateList(req.user.id, 'xbox');
   res.json({ ok: true });
 });
 
@@ -425,7 +506,7 @@ router.get('/xbox/games', requireAuth, async (req, res) => {
   const xbox  = user?.connectedAccounts?.xbox;
   if (!xbox?.apiKey) return res.status(400).json({ error: 'Xbox account not connected' });
 
-  try {
+  await servedLibrary(req, res, 'xbox', async () => {
     const titles = (await fetchXboxTitles(xbox.apiKey)).filter((t) => t.name && !isJunk(t.name));
     let cache = await loadCache();
     cache = await enrichItems(titles.slice(0, 200), cache, (g) => `xbox:${g.titleId}`, (g) => g.name);
@@ -445,11 +526,8 @@ router.get('/xbox/games', requireAuth, async (req, res) => {
       };
     });
 
-    res.json(dedupeByIgdb(mapped));
-  } catch (err) {
-    console.error('xbox/games error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+    return dedupeByIgdb(mapped);
+  });
 });
 
 // ── Epic Games (unofficial launcher auth, à la Legendary/Heroic) ────────────────
@@ -469,42 +547,65 @@ async function epicToken(params) {
   return data;
 }
 
+// Run an async worker over items with a fixed concurrency (no inter-item delay).
+async function mapPool(items, limit, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (next < items.length) {
+        const i = next++;
+        results[i] = await worker(items[i]);
+      }
+    })
+  );
+  return results;
+}
+
+// Resolve one namespace + id-chunk to game entries via Epic's catalog service.
+async function epicCatalogChunk(ns, ids, accessToken) {
+  const qs = ids.map((id) => `id=${id}`).join('&');
+  const out = [];
+  try {
+    const { data: items } = await axios.get(
+      `https://catalog-public-service-prod06.ol.epicgames.com/catalog/api/shared/namespace/${ns}/bulk/items?${qs}&country=US&locale=en-US&includeMainGameDetails=true`,
+      { headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000 }
+    );
+    for (const [catId, item] of Object.entries(items ?? {})) {
+      const cats = (item.categories ?? []).map((c) => c.path);
+      const isGame = cats.some((c) => c === 'games' || c.startsWith('games/'));
+      const isAddon = cats.some((c) => c === 'addons' || c.startsWith('addons/')) || !!item.mainGameItem;
+      if (!isGame || isAddon) continue;
+      if (/^unreal engine/i.test(item.title ?? '')) continue;
+      const img = (item.keyImages ?? []).find((k) => ['DieselStoreFrontTall', 'OfferImageTall', 'Thumbnail'].includes(k.type)) ?? item.keyImages?.[0];
+      out.push({ id: catId, title: item.title, image: img?.url ?? null });
+    }
+  } catch { /* skip this chunk */ }
+  return out;
+}
+
 async function epicFetchLibrary(accessToken) {
   const { data: assets } = await axios.get(
     'https://launcher-public-service-prod06.ol.epicgames.com/launcher/api/public/assets/Windows?label=Live',
     { headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000 }
   );
 
-  // Group catalog item ids by namespace (skip Unreal Engine assets).
+  // Epic gives most games their own namespace, so we group ids by namespace and
+  // chunk them, then resolve every chunk CONCURRENTLY (this was the slow part —
+  // it used to run one namespace at a time, sequentially).
   const byNs = {};
   for (const a of assets ?? []) {
     if (!a.namespace || !a.catalogItemId || a.namespace === 'ue') continue;
     (byNs[a.namespace] ??= new Set()).add(a.catalogItemId);
   }
-
-  const games = [];
+  const tasks = [];
   for (const [ns, idSet] of Object.entries(byNs)) {
     const ids = [...idSet];
-    for (let i = 0; i < ids.length; i += 40) {
-      const qs = ids.slice(i, i + 40).map((id) => `id=${id}`).join('&');
-      try {
-        const { data: items } = await axios.get(
-          `https://catalog-public-service-prod06.ol.epicgames.com/catalog/api/shared/namespace/${ns}/bulk/items?${qs}&country=US&locale=en-US&includeMainGameDetails=true`,
-          { headers: { Authorization: `Bearer ${accessToken}` }, timeout: 15000 }
-        );
-        for (const [catId, item] of Object.entries(items ?? {})) {
-          const cats = (item.categories ?? []).map((c) => c.path);
-          const isGame = cats.some((c) => c === 'games' || c.startsWith('games/'));
-          const isAddon = cats.some((c) => c === 'addons' || c.startsWith('addons/')) || !!item.mainGameItem;
-          if (!isGame || isAddon) continue;
-          if (/^unreal engine/i.test(item.title ?? '')) continue;
-          const img = (item.keyImages ?? []).find((k) => ['DieselStoreFrontTall', 'OfferImageTall', 'Thumbnail'].includes(k.type)) ?? item.keyImages?.[0];
-          games.push({ id: catId, title: item.title, image: img?.url ?? null });
-        }
-      } catch { /* skip this chunk */ }
-    }
+    for (let i = 0; i < ids.length; i += 40) tasks.push({ ns, ids: ids.slice(i, i + 40) });
   }
-  return games;
+
+  const chunks = await mapPool(tasks, 12, (t) => epicCatalogChunk(t.ns, t.ids, accessToken));
+  return chunks.flat();
 }
 
 router.put('/epic', requireAuth, async (req, res) => {
@@ -529,6 +630,7 @@ router.put('/epic', requireAuth, async (req, res) => {
     connectedAt: new Date().toISOString(),
   };
   await saveUsers(users);
+  invalidateList(req.user.id, 'epic');
   res.json({ displayName: token.displayName ?? 'Epic Player' });
 });
 
@@ -536,6 +638,7 @@ router.delete('/epic', requireAuth, async (req, res) => {
   const users = await loadUsers();
   const idx = users.findIndex((u) => u.id === req.user.id);
   if (idx !== -1) { delete users[idx].connectedAccounts?.epic; await saveUsers(users); }
+  invalidateList(req.user.id, 'epic');
   res.json({ ok: true });
 });
 
@@ -545,18 +648,20 @@ router.get('/epic/games', requireAuth, async (req, res) => {
   const epic = users[idx]?.connectedAccounts?.epic;
   if (!epic?.refreshToken) return res.status(400).json({ error: 'Epic account not connected' });
 
-  let accessToken;
-  try {
-    const token = await epicToken({ grant_type: 'refresh_token', refresh_token: epic.refreshToken, token_type: 'eg1' });
-    accessToken = token.access_token;
-    // Persist the rotated refresh token so future refreshes keep working.
-    users[idx].connectedAccounts.epic.refreshToken = token.refresh_token;
-    await saveUsers(users);
-  } catch {
-    return res.status(400).json({ error: 'Epic session expired. Please reconnect your Epic account.' });
-  }
+  await servedLibrary(req, res, 'epic', async () => {
+    // Token refresh only runs on a cache miss / forced refresh.
+    let accessToken;
+    try {
+      const token = await epicToken({ grant_type: 'refresh_token', refresh_token: epic.refreshToken, token_type: 'eg1' });
+      accessToken = token.access_token;
+      users[idx].connectedAccounts.epic.refreshToken = token.refresh_token; // rotate
+      await saveUsers(users);
+    } catch {
+      const e = new Error('Epic session expired. Please reconnect your Epic account.');
+      e.statusCode = 400;
+      throw e;
+    }
 
-  try {
     const owned = (await epicFetchLibrary(accessToken)).filter((g) => g.title && !isJunk(g.title));
     let cache = await loadCache();
     cache = await enrichItems(owned.slice(0, 200), cache, (g) => `epic:${g.id}`, (g) => g.title);
@@ -576,11 +681,8 @@ router.get('/epic/games', requireAuth, async (req, res) => {
       };
     });
 
-    res.json(dedupeByIgdb(mapped));
-  } catch (err) {
-    console.error('epic/games error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+    return dedupeByIgdb(mapped);
+  });
 });
 
 export default router;
